@@ -1,111 +1,66 @@
-//! This example demonstrates async/await usage with warp.
+#![deny(warnings)]
 
+use std::pin::Pin;
+
+use futures::{Stream, StreamExt};
 use juniper::{
-    graphql_object, EmptyMutation, EmptySubscription, FieldError, GraphQLEnum, RootNode,
+    http::GraphQLRequest, DefaultScalarValue, EmptyMutation, FieldError, RootNode,
+    SubscriptionCoordinator,
 };
-use warp::{http::Response, Filter};
+use juniper_subscriptions::Coordinator;
 
-#[derive(Clone, Copy, Debug)]
-struct Context;
-impl juniper::Context for Context {}
+#[derive(Clone)]
+pub struct Database;
 
-#[derive(Clone, Copy, Debug, GraphQLEnum)]
-enum UserKind {
-    Admin,
-    User,
-    Guest,
-}
+impl juniper::Context for Database {}
 
-#[derive(Clone, Debug)]
-struct User {
-    id: i32,
-    kind: UserKind,
-    name: String,
-}
-
-#[graphql_object(Context = Context)]
-impl User {
-    fn id(&self) -> i32 {
-        self.id
-    }
-
-    fn kind(&self) -> UserKind {
-        self.kind
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    async fn friends(&self) -> Vec<User> {
-        vec![]
+impl Database {
+    fn new() -> Self {
+        Self {}
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Query;
+pub struct Query;
 
-#[graphql_object(Context = Context)]
+#[juniper::graphql_object(Context = Database)]
 impl Query {
-    async fn users() -> Vec<User> {
-        vec![
-            User {
-                id: 1,
-                kind: UserKind::Admin,
-                name: "user1".into(),
-            },
-            User {
-                id: 2,
-                kind: UserKind::User,
-                name: "User Two".into(),
-            },
-        ]
-    }
-
-    /// Fetch a URL and return the response body text.
-    async fn request(url: String) -> Result<String, FieldError> {
-        Ok(reqwest::get(&url).await?.text().await?)
+    fn hello_world() -> &str {
+        "Hello World!"
     }
 }
 
-type Schema = RootNode<'static, Query, EmptyMutation<Context>, EmptySubscription<Context>>;
+pub struct Subscription;
+
+type StringStream = Pin<Box<dyn Stream<Item = Result<String, FieldError>> + Send>>;
+
+#[juniper::graphql_subscription(Context = Database)]
+impl Subscription {
+    async fn hello_world() -> StringStream {
+        let stream =
+            tokio::stream::iter(vec![Ok(String::from("Hello")), Ok(String::from("World!"))]);
+        Box::pin(stream)
+    }
+}
+
+type Schema = RootNode<'static, Query, EmptyMutation<Database>, Subscription>;
 
 fn schema() -> Schema {
-    Schema::new(
-        Query,
-        EmptyMutation::<Context>::new(),
-        EmptySubscription::<Context>::new(),
-    )
+    Schema::new(Query {}, EmptyMutation::new(), Subscription {})
 }
 
 #[tokio::main]
 async fn main() {
-    std::env::set_var("RUST_LOG", "warp_async");
-    env_logger::init();
-
-    let log = warp::log("warp_server");
-
-    let homepage = warp::path::end().map(|| {
-        Response::builder()
-            .header("content-type", "text/html")
-            .body(format!(
-                "<html><h1>juniper_warp</h1><div>visit <a href=\"/graphiql\">/graphiql</a></html>"
-            ))
-    });
-
-    log::info!("Listening on 127.0.0.1:8080");
-
-    let state = warp::any().map(|| Context);
-    let graphql_filter = juniper_warp::make_graphql_filter(schema(), state.boxed());
-
-    warp::serve(
-        warp::get()
-            .and(warp::path("graphiql"))
-            .and(juniper_warp::graphiql_filter("/graphql", None))
-            .or(homepage)
-            .or(warp::path("graphql").and(graphql_filter))
-            .with(log),
+    let schema = schema();
+    let coordinator = Coordinator::new(schema);
+    let req: GraphQLRequest<DefaultScalarValue> = serde_json::from_str(
+        r#"{
+            "query": "subscription { helloWorld }"
+        }"#,
     )
-    .run(([127, 0, 0, 1], 8080))
-    .await
+    .unwrap();
+    let ctx = Database::new();
+    let mut conn = coordinator.subscribe(&req, &ctx).await.unwrap();
+    while let Some(result) = conn.next().await {
+        println!("{}", serde_json::to_string(&result).unwrap());
+    }
 }
