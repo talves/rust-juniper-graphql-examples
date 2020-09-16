@@ -1,111 +1,140 @@
-//! This example demonstrates async/await usage with warp.
+use std::{env, pin::Pin, time::Duration};
+
+use actix_cors::Cors;
+use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
 
 use juniper::{
-    graphql_object, EmptyMutation, EmptySubscription, FieldError, GraphQLEnum, RootNode,
+    tests::fixtures::starwars::{model::Database, schema::Query},
+    DefaultScalarValue, EmptyMutation, FieldError, RootNode,
 };
-use warp::{http::Response, Filter};
+use juniper_actix::{graphql_handler, playground_handler, subscriptions::subscriptions_handler};
+use juniper_graphql_ws::ConnectionConfig;
 
-#[derive(Clone, Copy, Debug)]
-struct Context;
-impl juniper::Context for Context {}
+type Schema = RootNode<'static, Query, EmptyMutation<Database>, Subscription>;
 
-#[derive(Clone, Copy, Debug, GraphQLEnum)]
-enum UserKind {
-    Admin,
-    User,
-    Guest,
+fn schema() -> Schema {
+    Schema::new(Query, EmptyMutation::<Database>::new(), Subscription)
 }
 
-#[derive(Clone, Debug)]
-struct User {
-    id: i32,
-    kind: UserKind,
+async fn playground() -> Result<HttpResponse, Error> {
+    playground_handler("/graphql", Some("/subscriptions")).await
+}
+
+async fn graphql(
+    req: actix_web::HttpRequest,
+    payload: actix_web::web::Payload,
+    schema: web::Data<Schema>,
+) -> Result<HttpResponse, Error> {
+    let context = Database::new();
+    graphql_handler(&schema, &context, req, payload).await
+}
+
+struct Subscription;
+
+struct RandomHuman {
+    id: String,
     name: String,
 }
 
-#[graphql_object(Context = Context)]
-impl User {
-    fn id(&self) -> i32 {
-        self.id
-    }
-
-    fn kind(&self) -> UserKind {
-        self.kind
+// TODO: remove this when async interfaces are merged
+#[juniper::graphql_object(Context = Database)]
+impl RandomHuman {
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn name(&self) -> &str {
         &self.name
     }
+}
 
-    async fn friends(&self) -> Vec<User> {
-        vec![]
+type RandomHumanStream =
+    Pin<Box<dyn futures::Stream<Item = Result<RandomHuman, FieldError>> + Send>>;
+
+#[juniper::graphql_subscription(Context = Database)]
+impl Subscription {
+    #[graphql(
+        description = "A random humanoid creature in the Star Wars universe every 3 seconds. Second result will be an error."
+    )]
+    async fn random_human(context: &Database) -> RandomHumanStream {
+        let mut counter = 0;
+
+        let context = (*context).clone();
+
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::from_entropy();
+
+        let stream = tokio::time::interval(Duration::from_secs(3)).map(move |_| {
+            counter += 1;
+
+            if counter == 2 {
+                Err(FieldError::new(
+                    "some field error from handler",
+                    Value::Scalar(DefaultScalarValue::String(
+                        "some additional string".to_string(),
+                    )),
+                ))
+            } else {
+                let random_id = rng.gen_range(1000, 1005).to_string();
+                let human = context.get_human(&random_id).unwrap();
+
+                Ok(RandomHuman {
+                    id: human.id().to_owned(),
+                    name: human.name().to_owned(),
+                })
+            }
+        });
+
+        Box::pin(stream)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Query;
+async fn subscriptions(
+    req: HttpRequest,
+    stream: web::Payload,
+    schema: web::Data<Schema>,
+) -> Result<HttpResponse, Error> {
+    let context = Database::new();
+    let schema = schema.into_inner();
+    let config = ConnectionConfig::new(context);
+    // set the keep alive interval to 15 secs so that it doesn't timeout in playground
+    // playground has a hard-coded timeout set to 20 secs
+    let config = config.with_keep_alive_interval(Duration::from_secs(15));
 
-#[graphql_object(Context = Context)]
-impl Query {
-    async fn users() -> Vec<User> {
-        vec![
-            User {
-                id: 1,
-                kind: UserKind::Admin,
-                name: "user1".into(),
-            },
-            User {
-                id: 2,
-                kind: UserKind::User,
-                name: "User Two".into(),
-            },
-        ]
-    }
-
-    /// Fetch a URL and return the response body text.
-    async fn request(url: String) -> Result<String, FieldError> {
-        Ok(reqwest::get(&url).await?.text().await?)
-    }
+    subscriptions_handler(req, stream, schema, config).await
 }
 
-type Schema = RootNode<'static, Query, EmptyMutation<Context>, EmptySubscription<Context>>;
-
-fn schema() -> Schema {
-    Schema::new(
-        Query,
-        EmptyMutation::<Context>::new(),
-        EmptySubscription::<Context>::new(),
-    )
-}
-
-#[tokio::main]
-async fn main() {
-    std::env::set_var("RUST_LOG", "warp_async");
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    env::set_var("RUST_LOG", "info");
     env_logger::init();
 
-    let log = warp::log("warp_server");
-
-    let homepage = warp::path::end().map(|| {
-        Response::builder()
-            .header("content-type", "text/html")
-            .body(format!(
-                "<html><h1>juniper_warp</h1><div>visit <a href=\"/graphiql\">/graphiql</a></html>"
-            ))
-    });
-
-    log::info!("Listening on 127.0.0.1:8080");
-
-    let state = warp::any().map(|| Context);
-    let graphql_filter = juniper_warp::make_graphql_filter(schema(), state.boxed());
-
-    warp::serve(
-        warp::get()
-            .and(warp::path("graphiql"))
-            .and(juniper_warp::graphiql_filter("/graphql", None))
-            .or(homepage)
-            .or(warp::path("graphql").and(graphql_filter))
-            .with(log),
-    )
-    .run(([127, 0, 0, 1], 8080))
+    HttpServer::new(move || {
+        App::new()
+            .data(schema())
+            .wrap(middleware::Compress::default())
+            .wrap(middleware::Logger::default())
+            .wrap(
+                Cors::new()
+                    .allowed_methods(vec!["POST", "GET"])
+                    .supports_credentials()
+                    .max_age(3600)
+                    .finish(),
+            )
+            .service(web::resource("/subscriptions").route(web::get().to(subscriptions)))
+            .service(
+                web::resource("/graphql")
+                    .route(web::post().to(graphql))
+                    .route(web::get().to(graphql)),
+            )
+            .service(web::resource("/playground").route(web::get().to(playground)))
+            .default_service(web::route().to(|| {
+                HttpResponse::Found()
+                    .header("location", "/playground")
+                    .finish()
+            }))
+    })
+    .bind(format!("{}:{}", "127.0.0.1", 8080))?
+    .run()
     .await
 }
